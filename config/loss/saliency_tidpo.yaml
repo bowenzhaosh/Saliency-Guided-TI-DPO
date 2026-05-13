@@ -1,0 +1,28 @@
+# Saliency-Guided TI-DPO loss parameters
+name: saliency_tidpo
+use_tidpo: True
+beta: 0.2
+
+alpha: 0.5
+if_tdpo2: true
+
+gamma: 0.001
+alpha_triplet: 0.001
+reference_free: false
+enable_gradient_attribution: True
+
+# === Saliency-specific ===
+attribution_method: saliency
+saliency_top_k_layers: 2
+
+# Token-importance weighting
+lambda_importance: 0.2
+prior_sigma_div: 8.0
+
+# Anchor sampling
+anchor_max_new_tokens: 64
+anchor_top_k: 50
+anchor_top_p: 0.95
+anchor_temperature: 0.8
+
+kl_coef: 0.0

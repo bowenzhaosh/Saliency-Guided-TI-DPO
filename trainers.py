@@ -6,6 +6,7 @@ import torch.nn as nn
 import transformers
 from omegaconf import DictConfig
 import gradient_attribution  # Import gradient attribution module
+import saliency_attribution  # Import saliency-guided attribution module
 
 import torch.distributed as dist
 from torch.distributed.fsdp import (
@@ -570,7 +571,7 @@ class BasicTrainer(object):
                 prompt_input_ids, attention_mask=prompt_attention_mask,
                 max_length=self.config.max_length, do_sample=True, pad_token_id=self.tokenizer.pad_token_id)
 
-        if self.config.loss.name in ('tdpo', 'tidpo'):
+        if self.config.loss.name in ('tdpo', 'tidpo', 'saliency_tidpo'):
             ctx = lambda: (FSDP.summon_full_params(self.reference_model, writeback=False,
                                                    recurse=False) if 'FSDP' in self.config.trainer else contextlib.nullcontext())
             with ctx():
@@ -582,7 +583,7 @@ class BasicTrainer(object):
         policy_output = all_gather_if_needed(policy_output, self.rank, self.world_size)
         policy_output_decoded = self.tokenizer.batch_decode(policy_output, skip_special_tokens=True)
 
-        if self.config.loss.name in ('tdpo', 'tidpo'):
+        if self.config.loss.name in ('tdpo', 'tidpo', 'saliency_tidpo'):
             reference_output = pad_to_length(reference_output, self.config.max_length, self.tokenizer.pad_token_id)
             reference_output = all_gather_if_needed(reference_output, self.rank, self.world_size)
             reference_output_decoded = self.tokenizer.batch_decode(reference_output, skip_special_tokens=True)
@@ -613,9 +614,31 @@ class BasicTrainer(object):
                 print("Warning: concatenated_input_ids contains NaN")
                 raise ValueError("Input contains NaN")
         
+        # Pre-compute token importance weights BEFORE the DPO forward pass.
+        # Saliency needs its own forward+backward (with output_attentions=True).
+        # By running it first and freeing the graph, the DPO forward gets full GPU memory.
+        # The weight_matrix is detached — same result regardless of computation order.
+        _use_tidpo = getattr(self.config.loss, 'use_tidpo', False)
+        _precomputed_weights = None
+        if _use_tidpo:
+            _precomputed_weights = self._compute_token_importance_weights(
+                model,
+                concatenated_batch['concatenated_input_ids'],
+                concatenated_batch['concatenated_attention_mask'],
+            )
+            # CRITICAL: Clear parameter gradients left by attribution backward.
+            # Without this, attribution backward gradients accumulate with DPO
+            # backward gradients, causing different effective lr per method.
+            # With this, both methods contribute ONLY through their importance
+            # weights (detached tensors), making the comparison fair at same lr.
+            model.zero_grad()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
         # Model forward pass
         try:
-            all_logits = model(concatenated_batch['concatenated_input_ids'],
+            all_logits = model(concatenated_batch["concatenated_input_ids"],
+                           use_cache=False,
                                attention_mask=concatenated_batch['concatenated_attention_mask']).logits.to(torch.float32)
             
             if getattr(self.config, 'debug', False):
@@ -632,6 +655,7 @@ class BasicTrainer(object):
         with torch.no_grad():
             try:
                 reference_all_logits = reference_model(concatenated_batch['concatenated_input_ids'],
+                                                       use_cache=False,
                                                        attention_mask=concatenated_batch[
                                                            'concatenated_attention_mask']).logits.to(torch.float32)
                 
@@ -644,15 +668,9 @@ class BasicTrainer(object):
                 print(f"Reference model forward pass failed: {e}")
                 raise e
         
-        # Check if TIDPO (Token Importance DPO) is enabled
-        use_tidpo = getattr(self.config.loss, 'use_tidpo', False)
-        
-        if use_tidpo:
-            # Calculate token importance weights
-            weight_matrix = self._compute_token_importance_weights(
-                model, concatenated_batch['concatenated_input_ids'], 
-                concatenated_batch['concatenated_attention_mask']
-            )
+        # Token weights already precomputed above (before forward passes)
+        if _use_tidpo:
+            weight_matrix = _precomputed_weights
             all_logps_margin, all_position_kl, all_logps = _weighted_tdpo_get_batch_logps(
                 all_logits, reference_all_logits, concatenated_batch['concatenated_labels'], 
                 weight_matrix, average_log_prob=False
@@ -674,7 +692,7 @@ class BasicTrainer(object):
         
         # Calculate triplet loss (if TIDPO is enabled)
         triplet_loss = None
-        if use_tidpo:
+        if _use_tidpo:
             alpha_triplet = getattr(self.config.loss, 'alpha_triplet', 0.1)
             if alpha_triplet > 0:  # Only calculate triplet loss when alpha_triplet > 0
                 bsz = batch['chosen_input_ids'].shape[0]
@@ -702,10 +720,12 @@ class BasicTrainer(object):
         """
         concatenated_batch = concatenated_inputs(batch, pad_token_id=int(self.tokenizer.pad_token_id))
 
-        all_logits = model(concatenated_batch['concatenated_input_ids'],
+        all_logits = model(concatenated_batch["concatenated_input_ids"],
+                           use_cache=False,
                            attention_mask=concatenated_batch['concatenated_attention_mask']).logits.to(torch.float32)
         with torch.no_grad():
             reference_all_logits = reference_model(concatenated_batch['concatenated_input_ids'],
+                                                   use_cache=False,
                                                    attention_mask=concatenated_batch['concatenated_attention_mask']).logits.to(torch.float32)
 
         kl_coef = float(getattr(self.config.loss, 'kl_coef', 0.0))
@@ -1167,23 +1187,37 @@ class BasicTrainer(object):
         weight_matrix = torch.ones(batch_size, seq_len, device=device)
 
         try:
-            # Compute gradient attribution directly on token IDs (avoids decode/re-tokenize mismatch).
+            # Read config knobs
             enable_attr = getattr(self.config.loss, 'enable_gradient_attribution', True)
             lambda_importance = float(getattr(self.config.loss, 'lambda_importance', 0.8))
             lambda_importance = float(max(0.0, min(1.0, lambda_importance)))
             prior_sigma_div = float(getattr(self.config.loss, 'prior_sigma_div', 4.0))
             prior_sigma_div = float(max(1.0, prior_sigma_div))
 
+            # NEW: attribution method selector ('gradient' or 'saliency')
+            attribution_method = getattr(self.config.loss, 'attribution_method', 'gradient')
+            top_k_layers = int(getattr(self.config.loss, 'saliency_top_k_layers', 2))
+
             if enable_attr:
                 # NOTE: evaluation loops may wrap forward passes in `torch.no_grad()`.
-                # Gradient attribution requires gradients, so explicitly re-enable them here.
+                # Both attribution methods require gradients, so explicitly re-enable.
                 with torch.enable_grad():
-                    importances = gradient_attribution.compute_language_model_gradient_attribution_from_ids(
-                        model=model,
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        device=device,
-                    )
+                    if attribution_method == 'saliency':
+                        importances = saliency_attribution.compute_language_model_saliency_attribution_from_ids(
+                            model=model,
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            device=device,
+                            top_k_layers=top_k_layers,
+                        )
+                    else:
+                        # Original TI-DPO: gradient w.r.t. input embeddings
+                        importances = gradient_attribution.compute_language_model_gradient_attribution_from_ids(
+                            model=model,
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            device=device,
+                        )
             else:
                 importances = torch.zeros(batch_size, seq_len, device=device, dtype=torch.float32)
 
@@ -1280,7 +1314,7 @@ class BasicTrainer(object):
             metrics[f'logps_{train_test}/rejected'] = policy_rejected_logps.cpu().numpy().tolist()
             losses = final_losses
 
-        elif loss_config.name == 'tidpo':
+        elif loss_config.name in ('tidpo', 'saliency_tidpo'):
             # TI-DPO builds on the TDPO-style objective (same base as the repo's TDPO baseline),
             # but uses token-importance weighting (controlled by `use_tidpo`) and optionally adds
             # the triplet term.
@@ -1289,6 +1323,10 @@ class BasicTrainer(object):
                 self.reference_model,
                 batch,
             )
+
+            # Coerce None → zero tensor so downstream code works unchanged
+            if triplet_loss is None:
+                triplet_loss = torch.tensor(0.0, device=chosen_logps_margin.device)
 
             base_losses, chosen_rewards, rejected_rewards = tdpo_loss(
                 chosen_logps_margin,
@@ -1392,7 +1430,7 @@ class BasicTrainer(object):
         np.random.seed(self.seed)
         random.seed(self.seed)
 
-        if self.config.loss.name in ('tdpo', 'tidpo'):
+        if self.config.loss.name in ('tdpo', 'tidpo', 'saliency_tidpo'):
             self.reference_model.eval()
 
         self.example_counter = 0
@@ -1410,7 +1448,7 @@ class BasicTrainer(object):
                 if self.config.sample_during_eval:
                     all_policy_samples, all_reference_samples = [], []
                     policy_text_table = wandb.Table(columns=["step", "prompt", "sample"])
-                    if self.config.loss.name in ('tdpo', 'tidpo'):
+                    if self.config.loss.name in ('tdpo', 'tidpo', 'saliency_tidpo'):
                         reference_text_table = wandb.Table(columns=["step", "prompt", "sample"])
 
                 for eval_batch in (
@@ -1445,7 +1483,7 @@ class BasicTrainer(object):
 
                         for prompt, sample in zip(eval_batch['prompt'], policy_samples):
                             policy_text_table.add_data(self.example_counter, prompt, sample)
-                        if self.config.loss.name in ('tdpo', 'tidpo'):
+                        if self.config.loss.name in ('tdpo', 'tidpo', 'saliency_tidpo'):
                             for prompt, sample in zip(eval_batch['prompt'], reference_samples):
                                 reference_text_table.add_data(self.example_counter, prompt, sample)
 
@@ -1453,7 +1491,7 @@ class BasicTrainer(object):
                 rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
                 if self.config.sample_during_eval:
                     rank0_print(json.dumps(all_policy_samples[:10], indent=2))
-                    if self.config.loss.name in ('tdpo', 'tidpo'):
+                    if self.config.loss.name in ('tdpo', 'tidpo', 'saliency_tidpo'):
                         rank0_print(json.dumps(all_reference_samples[:10], indent=2))
 
                 if self.config.wandb.enabled and self.rank == 0:
@@ -1461,7 +1499,7 @@ class BasicTrainer(object):
 
                     if self.config.sample_during_eval:
                         wandb.log({"policy_samples": policy_text_table}, step=self.example_counter)
-                        if self.config.loss.name in ('tdpo', 'tidpo'):
+                        if self.config.loss.name in ('tdpo', 'tidpo', 'saliency_tidpo'):
                             wandb.log({"reference_samples": reference_text_table}, step=self.example_counter)
 
                 if self.example_counter > 0:
@@ -1618,7 +1656,7 @@ class FSDPTrainer(BasicTrainer):
                                                check_fn=check_fn)
                 rank0_print('FSDP activation checkpointing enabled!')
 
-        if config.loss.name in ('tdpo', 'tidpo'):
+        if config.loss.name in ('tdpo', 'tidpo', 'saliency_tidpo'):
             rank0_print('Sharding reference model...')
             self.reference_model = FSDP(reference_model, **shared_fsdp_kwargs)
 
@@ -1666,7 +1704,7 @@ class TensorParallelTrainer(BasicTrainer):
 
         rank0_print('Sharding policy...')
         self.policy = tp.tensor_parallel(policy, sharded=True)
-        if config.loss.name in ('tdpo', 'tidpo'):
+        if config.loss.name in ('tdpo', 'tidpo', 'saliency_tidpo'):
             rank0_print('Sharding reference model...')
             self.reference_model = tp.tensor_parallel(reference_model, sharded=False)
 

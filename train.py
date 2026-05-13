@@ -89,11 +89,23 @@ def main(config: DictConfig):
     print('building policy')
     model_kwargs = {'device_map': 'balanced'} if config.trainer == 'BasicTrainer' else {}
     policy_dtype = getattr(torch, config.model.policy_dtype)
+    # Load with eager attention for saliency gradient compatibility
+    if config.loss.name == 'saliency_tidpo':
+        model_kwargs['attn_implementation'] = 'eager'
+
+    # Multi-GPU model parallelism: spread model across available GPUs
+    # without FSDP (which is incompatible with token-level attribution).
+    # Only use device_map when BasicTrainer + multiple GPUs available.
+    n_gpus = torch.cuda.device_count()
+    if config.trainer == 'BasicTrainer' and n_gpus > 1:
+        model_kwargs['device_map'] = 'auto'
+        print(f'Using device_map=auto across {n_gpus} GPUs')
+
     policy = transformers.AutoModelForCausalLM.from_pretrained(
         config.model.name_or_path, cache_dir=get_local_dir(config.local_dirs), low_cpu_mem_usage=True, torch_dtype=policy_dtype, **model_kwargs)
     disable_dropout(policy)
 
-    if config.loss.name in ('tdpo', 'tidpo'):
+    if config.loss.name in ('tdpo', 'tidpo', 'saliency_tidpo'):
         print('building reference model')
         reference_model_dtype = getattr(torch, config.model.reference_dtype)
         reference_model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -107,7 +119,7 @@ def main(config: DictConfig):
         step, metrics = state_dict['step_idx'], state_dict['metrics']
         print(f'loading pre-trained weights at step {step} from {config.model.archive} with metrics {json.dumps(metrics, indent=2)}')
         policy.load_state_dict(state_dict['state'])
-        if config.loss.name in ('tdpo', 'tidpo'):
+        if config.loss.name in ('tdpo', 'tidpo', 'saliency_tidpo'):
             reference_model.load_state_dict(state_dict['state'])
         print('loaded pre-trained weights')
 
