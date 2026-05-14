@@ -1,4 +1,14 @@
 #!/bin/bash
+#SBATCH --account=grp_xiyanghu
+#SBATCH --partition=public
+#SBATCH --qos=public
+#SBATCH --gres=gpu:a100:2
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=128G
+#SBATCH --time=168:00:00
+#SBATCH --mail-user=bzhao112@asu.edu
+#SBATCH --mail-type=END,FAIL
 eval "$(~/miniconda3/bin/conda shell.bash hook)"
 conda activate tidpo
 cd ~/TIDPO
