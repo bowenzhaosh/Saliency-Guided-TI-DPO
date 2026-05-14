@@ -507,6 +507,7 @@ class BasicTrainer(object):
             max_length=config.max_length,
             max_prompt_length=config.max_prompt_length,
             sft_mode=config.loss.name == 'sft',
+            seed=seed,
         )
 
         self.policy = policy
